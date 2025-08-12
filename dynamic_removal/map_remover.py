@@ -54,22 +54,34 @@ class FastKDTree:
         self.checks = checks
 
     def query(self, points, k=1):
-        # torch 입력 처리
+        # 1) remember original device only if torch input
+        orig_device = None
         if isinstance(points, torch.Tensor):
-            device = points.device
+            orig_device = points.device
             points = points.detach().cpu().numpy()
-        else:
-            device = None
         points = np.asarray(points, dtype=np.float32)
-        idxs, dists = self.flann.nn_index(points, k, checks=self.checks)
-        dists = torch.sqrt(dists)
-        # torch로 다시 올려주기 (원래 device 유지)
-        if device:
+
+        # 2) flann query -> returns (idxs, d2)
+        idxs, d2 = self.flann.nn_index(points, k, checks=self.checks)
+
+        # 3) ensure 2D shape (N, k)
+        if d2.ndim == 1 and k == 1:
+            d2 = d2[:, None]
+            idxs = idxs[:, None]
+
+        # 4) if metric is L2 (squared), convert to Euclidean distance
+        #    -> keep a flag in your class like self.squared = True if using L2
+        if getattr(self, "squared", True):
+            d = np.sqrt(np.maximum(d2, 0.0, dtype=np.float32)).astype(np.float32)
+        else:
+            d = d2.astype(np.float32)
+
+        if orig_device is not None:
             return (
-                torch.as_tensor(dists, device=device, dtype=torch.float32),
-                torch.as_tensor(idxs, device=device, dtype=torch.int64)
+                torch.as_tensor(d, device=orig_device, dtype=torch.float32),
+                torch.as_tensor(idxs, device=orig_device, dtype=torch.int64)
             )
-        return dists, idxs
+        return d, idxs
 
 
 
@@ -264,7 +276,6 @@ class MapRemover:
             # torch.cuda.synchronize()
             # print("이거뜨면 free space 업뎃까지는 잘된거임")
 
-        anchor_logits = anchor_logits / torch.clamp(anchor_counts, min=1)  
         anchor_eph_l = inv_logit(anchor_logits) 
 
 
