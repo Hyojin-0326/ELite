@@ -4,8 +4,52 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import KDTree
 from tqdm import tqdm
+import torch
+import faiss
+import pyflann
 
 from utils.session_map import SessionMap
+
+class FastKDTree:
+    def __init__(self, data, num_trees=8, checks=64):
+        # 입력이 torch면 numpy로 변환
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+        self.flann = pyflann.FLANN()
+        self.data = np.asarray(data, dtype=np.float32)
+        # kdtree 여러 개로 근사 정확도 높이기
+        self.params = self.flann.build_index(self.data, algorithm="kdtree", trees=num_trees)
+        self.checks = checks
+
+    def query(self, points, k=1):
+        # 1) remember original device only if torch input
+        orig_device = None
+        if isinstance(points, torch.Tensor):
+            orig_device = points.device
+            points = points.detach().cpu().numpy()
+        points = np.asarray(points, dtype=np.float32)
+
+        # 2) flann query -> returns (idxs, d2)
+        idxs, d2 = self.flann.nn_index(points, k, checks=self.checks)
+
+        # 3) ensure 2D shape (N, k)
+        if d2.ndim == 1 and k == 1:
+            d2 = d2[:, None]
+            idxs = idxs[:, None]
+
+        # 4) if metric is L2 (squared), convert to Euclidean distance
+        #    -> keep a flag in your class like self.squared = True if using L2
+        if getattr(self, "squared", True):
+            d = np.sqrt(np.maximum(d2, 0.0, dtype=np.float32)).astype(np.float32)
+        else:
+            d = d2.astype(np.float32)
+
+        if orig_device is not None:
+            return (
+                torch.as_tensor(d, device=orig_device, dtype=torch.float32),
+                torch.as_tensor(idxs, device=orig_device, dtype=torch.int64)
+            )
+        return d, idxs
 
 
 class MapUpdater():
@@ -36,6 +80,7 @@ class MapUpdater():
         self.new_session_map = new_session_map
 
 
+    #이거 토치로 바로 쌓을수도? 일단 모듈 각각에서 토치로 만들고 나중에 session 로더에서 인풋자체를 한번에 토치로 바꾸면될듯
     def _get_merged_map(self):
         if self.lifelong_map is None or self.new_session_map is None:
             raise ValueError("Both lifelong_map and new_session_map must be loaded before merging.")
@@ -47,9 +92,11 @@ class MapUpdater():
 
 
     def classify_map_points(self):
-        pts_coexist = [] # C_t
-        pts_deleted = [] # D_t, negative diff
-        pts_emerged = [] # E_t, positive diff
+
+        prev_dists, prev_idx = self.lifelong_map.kdtree.query(merged_map)
+        new_dists,  new_idx  = self.new_session_map.kdtree.query(merged_map)
+
+
 
         # Classify points in the merged map into coexist, deleted, and emerged
         merged_map = self._get_merged_map()

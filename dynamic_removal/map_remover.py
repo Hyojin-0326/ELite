@@ -90,48 +90,6 @@ def downsample_points(points, voxel_size: float):
     downsampled = np.asarray(pcd.points)
     return torch.as_tensor(downsampled, device=device, dtype=dtype)
 
-class FastKDTree:
-    def __init__(self, data, num_trees=8, checks=64):
-        # 입력이 torch면 numpy로 변환
-        if isinstance(data, torch.Tensor):
-            data = data.detach().cpu().numpy()
-        self.flann = pyflann.FLANN()
-        self.data = np.asarray(data, dtype=np.float32)
-        # kdtree 여러 개로 근사 정확도 높이기
-        self.params = self.flann.build_index(self.data, algorithm="kdtree", trees=num_trees)
-        self.checks = checks
-
-    def query(self, points, k=1):
-        # 1) remember original device only if torch input
-        orig_device = None
-        if isinstance(points, torch.Tensor):
-            orig_device = points.device
-            points = points.detach().cpu().numpy()
-        points = np.asarray(points, dtype=np.float32)
-
-        # 2) flann query -> returns (idxs, d2)
-        idxs, d2 = self.flann.nn_index(points, k, checks=self.checks)
-
-        # 3) ensure 2D shape (N, k)
-        if d2.ndim == 1 and k == 1:
-            d2 = d2[:, None]
-            idxs = idxs[:, None]
-
-        # 4) if metric is L2 (squared), convert to Euclidean distance
-        #    -> keep a flag in your class like self.squared = True if using L2
-        if getattr(self, "squared", True):
-            d = np.sqrt(np.maximum(d2, 0.0, dtype=np.float32)).astype(np.float32)
-        else:
-            d = d2.astype(np.float32)
-
-        if orig_device is not None:
-            return (
-                torch.as_tensor(d, device=orig_device, dtype=torch.float32),
-                torch.as_tensor(idxs, device=orig_device, dtype=torch.int64)
-            )
-        return d, idxs
-
-
 
 class MapRemover:
     def __init__(
