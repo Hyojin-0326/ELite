@@ -47,6 +47,9 @@ class MapUpdater():
     def load(self, lifelong_map: SessionMap, new_session_map: SessionMap):
         self.lifelong_map = lifelong_map
         self.new_session_map = new_session_map
+        self.lifelong_map.build_faiss_index(m=32, ef_construction=80, ef_search=64)
+        self.new_session_map.build_faiss_index(m=32, ef_construction=80, ef_search=64)
+
 
     def _build_global_faiss(self):
         # Flat L2 for exact KNN on 3D points
@@ -56,26 +59,31 @@ class MapUpdater():
         self.faiss_new.add(self.new_session_map.map.astype('float32'))
 
     @staticmethod
-    def _build_local_faiss_index(points: np.ndarray, m: int = 32):
-        # HNSW for faster local overlap checks on coexist set
+    def _build_local_faiss_index(points: np.ndarray, m: int = 32, ef_search: int = 64):
+        # CHANGED: KDTree → HNSW(FAISS)로 로컬 오버랩 체크도 근사화
         if points is None or points.size == 0:
             return None
+        pts = np.ascontiguousarray(points, dtype=np.float32)  
         index = faiss.IndexHNSWFlat(3, m)
-        index.add(points.astype('float32'))
+        index.hnsw.efConstruction = 80
+        index.hnsw.efSearch = ef_search
+        index.add(pts)
         return index
 
     @staticmethod
     def _faiss_knn_with(index, queries: np.ndarray, k: int = 1):
+        # 동일: 제곱거리 반환 전제
         if queries is None or queries.size == 0:
-            # shape-safe empty
-            return np.empty((0, k), dtype=np.float32), np.empty((0, k), dtype=np.int64)
+            return (np.empty((0, k), dtype=np.float32),
+                    np.empty((0, k), dtype=np.int64))
         if index is None:
-            # coexist가 비었으면 분류 시 전부 non-overlap로 빠지게 됨
             n = len(queries)
-            return np.full((n, k), np.inf, dtype=np.float32), np.full((n, k), -1, dtype=np.int64)
-        d2, idx = index.search(queries.astype('float32'), k)
-        d = np.sqrt(d2).astype(np.float32)
-        return d, idx
+            return (np.full((n, k), np.inf, dtype=np.float32),
+                    np.full((n, k), -1, dtype=np.int64))
+        q = np.ascontiguousarray(queries, dtype=np.float32) 
+        d2, idx = index.search(q, k)
+        return d2, idx  
+    
 
     #이거 토치로 바로 쌓을수도? 일단 모듈 각각에서 토치로 만들고 나중에 session 로더에서 인풋자체를 한번에 토치로 바꾸면될듯
     def _get_merged_map(self):
@@ -85,31 +93,31 @@ class MapUpdater():
         merged_map_o3d.points = o3d.utility.Vector3dVector(
             np.vstack((self.lifelong_map.map, self.new_session_map.map)))
         merged_map_o3d = merged_map_o3d.voxel_down_sample(voxel_size=self.voxel_size)
-        return np.asarray(merged_map_o3d.points)
+        merged = np.asarray(merged_map_o3d.points)
+        return merged
 
 
     def classify_map_points(self):
         
         #1) load map, build fiass idx
-        merged_map = self._get_merged_map().astype('float32')
+        merged_map = self._get_merged_map()
+        merged_f32 = np.ascontiguousarray(merged_map, dtype=np.float32) 
 
         if self.faiss_prev is None or self.faiss_new is None:
             self._build_global_faiss()
 
 
         # 1-1) knn query
-        prev_dists2, prev_idx = self.faiss_prev.search(merged_map, k=1)
-        new_dists2,  new_idx  = self.faiss_new.search(merged_map, k=1)
-
+        prev_d2, prev_idx = self.lifelong_map.faiss_knn_np(merged_f32, k=1)  # CHANGED
+        new_d2,  new_idx  = self.new_session_map.faiss_knn_np(merged_f32, k=1)  # CHANGED
         prev_idx = prev_idx.ravel()
         new_idx  = new_idx.ravel()
 
-        prev_dists = np.sqrt(prev_dists2).ravel()
-        new_dists = np.sqrt(new_dists2).ravel()
 
         #2) 
-        prev_close = prev_dists<self.coexist_threshold
-        new_close = new_dists<self.coexist_threshold
+        th2 = float(self.coexist_threshold) * float(self.coexist_threshold)
+        prev_close = (prev_d2.ravel() < th2)
+        new_close  = (new_d2.ravel()  < th2)
 
         mask_coexist =  prev_close &  new_close
         mask_deleted =  prev_close & ~new_close
@@ -123,14 +131,15 @@ class MapUpdater():
 
 
         #3) overlap vs non_overlap among coexist
-        coexist_index = self._build_local_faiss_index(pts_coexist, m=32)
+        coexist_index = self._build_local_faiss_index(pts_coexist, m=32, ef_search=64)  # CHANGED
 
-        dist_del, _ = self._faiss_knn_with(coexist_index, pts_deleted)
-        dist_emg, _ = self._faiss_knn_with(coexist_index, pts_emerged)
 
-        mask_del_overlap = dist_del.ravel()<self.overlap_threshold
-        mask_emg_overlap = dist_emg.ravel()<self.overlap_threshold
+        del_d2, _ = self._faiss_knn_with(coexist_index, pts_deleted)
+        emg_d2, _ = self._faiss_knn_with(coexist_index, pts_emerged)
 
+        ovl2 = float(self.overlap_threshold) * float(self.overlap_threshold)
+        mask_del_overlap = del_d2.ravel() < ovl2
+        mask_emg_overlap = emg_d2.ravel() < ovl2
         
         #cache ----------
         coexist_prev_idx = prev_idx[mask_coexist]
@@ -138,17 +147,12 @@ class MapUpdater():
         deleted_prev_idx = prev_idx[mask_deleted]
         emerged_new_idx  = new_idx[mask_emerged]
 
-        deleted_overlap_prev_idx    = deleted_prev_idx[mask_del_overlap]
-        deleted_nonoverlap_prev_idx = deleted_prev_idx[~mask_del_overlap]
-        emerged_overlap_new_idx     = emerged_new_idx[mask_emg_overlap]
-        emerged_nonoverlap_new_idx  = emerged_new_idx[~mask_emg_overlap]
-
         self.coexist_prev_idx = coexist_prev_idx
-        self.coexist_new_idx = coexist_new_idx
-        self.deleted_overlap_prev_idx = deleted_overlap_prev_idx
-        self.deleted_nonoverlap_prev_idx = deleted_nonoverlap_prev_idx
-        self.emerged_overlap_new_idx = emerged_overlap_new_idx
-        self.emerged_nonoverlap_new_idx = emerged_nonoverlap_new_idx
+        self.coexist_new_idx  = coexist_new_idx
+        self.deleted_overlap_prev_idx    = deleted_prev_idx[mask_del_overlap]
+        self.deleted_nonoverlap_prev_idx = deleted_prev_idx[~mask_del_overlap]
+        self.emerged_overlap_new_idx     = emerged_new_idx[mask_emg_overlap]
+        self.emerged_nonoverlap_new_idx  = emerged_new_idx[~mask_emg_overlap]
         
         #cache -----------------
 
@@ -213,7 +217,6 @@ class MapUpdater():
                                if len(self.deleted_nonoverlap_prev_idx) > 0 else np.zeros(0, dtype=np.float32)
         return np.asarray(eph_g_deleted)
 
-
     def _update_global_eph_emerged(self, pts_emerged, overlap=True):
         if overlap:
             if pts_emerged is None or len(pts_emerged) == 0:
@@ -221,12 +224,15 @@ class MapUpdater():
             else: 
                 gamma_emg = self._calc_objectness_factor(pts_emerged)
                 eph_l_new = self.new_session_map.eph[self.emerged_overlap_new_idx]
-                eph_g_merged = self.uncertainty_factor * (2.0 - gamma_emg) * eph_l_new
+                eph_g_emerged = self.uncertainty_factor * (2.0 - gamma_emg) * eph_l_new
 
-        else: # non-overlap
-            eph_g_emerged = self.new_session_map.eph[self.emerged_nonoverlap_new_idx] \
-                               if len(self.emerged_nonoverlap_new_idx) > 0 else np.zeros(0, dtype=np.float32)
-        return eph_g_emerged 
+        else:  # non-overlap
+            if hasattr(self, "emerged_nonoverlap_new_idx") and len(self.emerged_nonoverlap_new_idx) > 0:
+                eph_g_emerged = self.new_session_map.eph[self.emerged_nonoverlap_new_idx]
+            else:
+                eph_g_emerged = np.zeros(0, dtype=np.float32)
+
+        return eph_g_emerged
 
 
     def _remove_dynamic_points(self, points: np.ndarray, eph: np.ndarray):

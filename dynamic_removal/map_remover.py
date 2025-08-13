@@ -128,7 +128,7 @@ class MapRemover:
             logger.info(f"Processing scan {i+1}/{self.num_scans}")
             legacy_pcd = self.session_loader[i].get()
             points_np = np.asarray(legacy_pcd.points)
-            logger.info(f"Legacy pcd #{i} has {points_np.shape[0]} points")
+            # logger.info(f"Legacy pcd #{i} has {points_np.shape[0]} points")
 
             # NaN/Inf 체크 (numpy → torch 안 거치고 바로)
             if np.isnan(points_np).any() or np.isinf(points_np).any():
@@ -139,7 +139,7 @@ class MapRemover:
                 tpcd = o3d.t.geometry.PointCloud.from_legacy(legacy_pcd)
                 positions_o3c = tpcd.point["positions"]
                 positions_torch = torch.utils.dlpack.from_dlpack(positions_o3c.to_dlpack()).to(device="cuda", dtype=torch.float32)
-                logger.info(f"Converted to torch tensor: shape={positions_torch.shape}, dtype={positions_torch.dtype}, device={positions_torch.device}")
+                # logger.info(f"Converted to torch tensor: shape={positions_torch.shape}, dtype={positions_torch.dtype}, device={positions_torch.device}")
 
                 self.gpu_scans.append(positions_torch)
             except Exception as e:
@@ -149,7 +149,7 @@ class MapRemover:
             try:
                 pose_np = self.session_loader.get_pose(i)[:3, 3].astype(np.float32)
                 gpu_pose = torch.as_tensor(pose_np, dtype=torch.float32, device='cuda')
-                logger.info(f"Pose #{i}: {gpu_pose.cpu().numpy()}")
+                # logger.info(f"Pose #{i}: {gpu_pose.cpu().numpy()}")
                 self.gpu_poses.append(gpu_pose)
             except Exception as e:
                 logger.error(f"Failed to load pose #{i}: {e}")

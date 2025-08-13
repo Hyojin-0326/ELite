@@ -1,0 +1,12 @@
+map_update:
+  coexist_threshold: 0.1
+  density_radius: 0.2
+  global_eph_threshold: 0.5
+  overlap_threshold: 0.15
+  remove_dynamic_points: true
+  remove_outlier_points: true
+  rho_factor: 2.0
+  uncertainty_factor: 0.8
+  voxel_size: 0.05
+settings:
+  output_dir: ./test_output
