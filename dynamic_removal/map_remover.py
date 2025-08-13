@@ -212,12 +212,13 @@ class MapRemover:
         logger.info(f"Built FAISS HNSW index with {anchor_np.shape[0]} points")
 
     def faiss_knn(self, queries: torch.Tensor, k: int):
-        # **쿼리 (GPU→numpy→FAISS→Torch)**
         queries_np = queries.detach().cpu().numpy().astype('float32')
-        dists, idx = self.faiss_index.search(queries_np, k)
-        dists = torch.as_tensor(dists, device=queries.device)
+        d2, idx = self.faiss_index.search(queries_np, k)  # squared L2
+        #sqrt
+        d = np.sqrt(d2, dtype=np.float32)
+        d = torch.as_tensor(d, device=queries.device)
         idx = torch.as_tensor(idx, device=queries.device, dtype=torch.int64)
-        return dists, idx
+        return d, idx
 
 
     def run(self):
