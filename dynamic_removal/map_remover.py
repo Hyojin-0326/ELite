@@ -16,6 +16,54 @@ from utils.session_map import SessionMap
 from utils.logger import logger
 
 
+#select the first point from the voxel
+def downsample_points_torch(points, voxel_size: float):
+    """
+    points: torch.Tensor (N,3) or numpy.ndarray (N,3)
+    voxel_size: float
+    returns: same type as input, downsampled
+    """
+    # normalize input -> torch tensor
+    if isinstance(points, np.ndarray):
+        t = torch.as_tensor(points)            # CPU
+        return_numpy = True
+    elif isinstance(points, torch.Tensor):
+        t = points
+        return_numpy = False
+    else:
+        raise TypeError(f"Unsupported type: {type(points)}")
+
+    if t.numel() == 0:
+        return points
+
+    device = t.device
+    dtype  = t.dtype
+
+    # 1) compute voxel integer coordinates
+    v = torch.floor(t / voxel_size)            # float
+    v = v.to(torch.int64)                      # int64 for stable hashing
+
+    # 2) hash each voxel coord (64-bit safe)
+    keys = v[:, 0] * 73856093 + v[:, 1] * 19349663 + v[:, 2] * 83492791
+
+    # 3) group by key without return_index:
+    #    sort by key -> take the first index of each group
+    idx_sort = torch.argsort(keys)             # [N]
+    keys_sorted = keys[idx_sort]               # [N]
+
+    # mask marking first occurrence of each key in the sorted list
+    first_mask = torch.ones_like(keys_sorted, dtype=torch.bool)
+    first_mask[1:] = keys_sorted[1:] != keys_sorted[:-1]
+
+    first_idx = idx_sort[first_mask]           # original indices of first reps
+    out = t[first_idx].to(device=device, dtype=dtype)
+
+    if return_numpy:
+        return out.cpu().numpy()
+    return out
+
+# replaced downsample_points to downsample_points_torch. 
+# (more faster but less accurate, It will be determined after evaluating the outputs.)
 def downsample_points(points, voxel_size: float):
     """
     points: torch.Tensor (GPU/CPU) 또는 numpy.ndarray (N,3)
@@ -164,12 +212,13 @@ class MapRemover:
         logger.info(f"Built FAISS HNSW index with {anchor_np.shape[0]} points")
 
     def faiss_knn(self, queries: torch.Tensor, k: int):
-        # **쿼리 (GPU→numpy→FAISS→Torch)**
         queries_np = queries.detach().cpu().numpy().astype('float32')
-        dists, idx = self.faiss_index.search(queries_np, k)
-        dists = torch.as_tensor(dists, device=queries.device)
+        d2, idx = self.faiss_index.search(queries_np, k)  # squared L2
+        # sqrt
+        d = np.sqrt(d2, dtype=np.float32)
+        d = torch.as_tensor(d, device=queries.device)
         idx = torch.as_tensor(idx, device=queries.device, dtype=torch.int64)
-        return dists, idx
+        return d, idx
 
 
     def run(self):
@@ -186,7 +235,7 @@ class MapRemover:
         # 2) Select anchor points for local ephemerality update
         tpcd_map = o3d.t.geometry.PointCloud()
 
-        anchor_points_tensor = downsample_points(session_map_tensor, p_dor["anchor_voxel_size"])
+        anchor_points_tensor = downsample_points_torch(session_map_tensor, p_dor["anchor_voxel_size"])
         num_anchor_points = anchor_points_tensor.shape[0]
 
         if num_anchor_points == 0:
@@ -195,7 +244,7 @@ class MapRemover:
     
 
         self.build_faiss_index(anchor_points_tensor)
-        logger.info(f"Built CuPyKDTree with {num_anchor_points} points")
+        logger.info(f"Built HNSW with {num_anchor_points} points")
 
 
         #_________ 베이지안 업뎃을 logit으로 하기_________        
@@ -257,7 +306,7 @@ class MapRemover:
 
             # #----
 
-            free_space_samples = downsample_points(free_space_samples, 0.1)
+            free_space_samples = downsample_points_torch(free_space_samples, 0.1)
             dists, inds = self.faiss_knn(free_space_samples, p_dor["num_k"])
 
             # 마스크처럼 쓰려고 플래튼
