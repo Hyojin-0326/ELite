@@ -35,6 +35,15 @@ class MapUpdater():
         self.faiss_prev = None  # for lifelong_map
         self.faiss_new  = None  # for new_session_map
 
+        #idx for Global eph update 
+        self.coexist_prev_idx = None
+        self.coexist_new_idx = None
+        self.deleted_overlap_prev_idx = None
+        self.deleted_overlap_new_idx = None
+        self.emerged_overlap_new_idx = None
+        self.emerged_nonoverlap_new_idx = None
+
+
     def load(self, lifelong_map: SessionMap, new_session_map: SessionMap):
         self.lifelong_map = lifelong_map
         self.new_session_map = new_session_map
@@ -82,7 +91,7 @@ class MapUpdater():
     def classify_map_points(self):
         
         #1) load map, build fiass idx
-        merged_map = self._get_merged_map(as_tensor=False).astype('float32')
+        merged_map = self._get_merged_map().astype('float32')
 
         if self.faiss_prev is None or self.faiss_new is None:
             self._build_global_faiss()
@@ -91,6 +100,9 @@ class MapUpdater():
         # 1-1) knn query
         prev_dists2, prev_idx = self.faiss_prev.search(merged_map, k=1)
         new_dists2,  new_idx  = self.faiss_new.search(merged_map, k=1)
+
+        prev_idx = prev_idx.ravel()
+        new_idx  = new_idx.ravel()
 
         prev_dists = np.sqrt(prev_dists2).ravel()
         new_dists = np.sqrt(new_dists2).ravel()
@@ -109,14 +121,38 @@ class MapUpdater():
 
         pts_coexist = np.array(pts_coexist)
 
+
         #3) overlap vs non_overlap among coexist
         coexist_index = self._build_local_faiss_index(pts_coexist, m=32)
 
-        dist_del, _ = self.faiss_knn_with(coexist_index, pts_deleted)
-        dist_emg, _ = self.faiss_knn_with(coexist_index, pts_emerged)
+        dist_del, _ = self._faiss_knn_with(coexist_index, pts_deleted)
+        dist_emg, _ = self._faiss_knn_with(coexist_index, pts_emerged)
 
         mask_del_overlap = dist_del.ravel()<self.overlap_threshold
         mask_emg_overlap = dist_emg.ravel()<self.overlap_threshold
+
+        
+        #cache ----------
+        coexist_prev_idx = prev_idx[mask_coexist]
+        coexist_new_idx  = new_idx[mask_coexist]
+        deleted_prev_idx = prev_idx[mask_deleted]
+        emerged_new_idx  = new_idx[mask_emerged]
+
+        deleted_overlap_prev_idx    = deleted_prev_idx[mask_del_overlap]
+        deleted_nonoverlap_prev_idx = deleted_prev_idx[~mask_del_overlap]
+        emerged_overlap_new_idx     = emerged_new_idx[mask_emg_overlap]
+        emerged_nonoverlap_new_idx  = emerged_new_idx[~mask_emg_overlap]
+
+        self.coexist_prev_idx = coexist_prev_idx
+        self.coexist_new_idx = coexist_new_idx
+        self.deleted_overlap_prev_idx = deleted_overlap_prev_idx
+        self.deleted_nonoverlap_prev_idx = deleted_nonoverlap_prev_idx
+        self.emerged_overlap_new_idx = emerged_overlap_new_idx
+        self.emerged_nonoverlap_new_idx = emerged_nonoverlap_new_idx
+        
+        #cache -----------------
+
+
 
         return {
             "pts_coexist": pts_coexist,
@@ -150,67 +186,51 @@ class MapUpdater():
         }
 
     def _update_global_eph_coexist(self, pts_coexist):
-        # Coexist points
-        eph_g_coexist = []
-        for point in tqdm(pts_coexist, 
-                          desc="Updating \u03B5_g (Coexist)", ncols=100):
-            _, prev_idx = self.lifelong_map.kdtree.query(point)
-            _, new_idx = self.new_session_map.kdtree.query(point)
-            eph_g_prev = self.lifelong_map.eph[prev_idx]
-            eph_l_new = self.new_session_map.eph[new_idx]
-            eph_g_new = (
-                (eph_g_prev * eph_l_new) /
-                (eph_g_prev * eph_l_new + (1 - eph_g_prev) * (1 - eph_l_new))
-            )# Eq. 7
-            eph_g_coexist.append(eph_g_new)
-        return np.asarray(eph_g_coexist)
+        eph_g_prev = self.lifelong_map.eph[self.coexist_prev_idx]
+        eph_l_new  = self.new_session_map.eph[self.coexist_new_idx]
+
+        denom = (eph_g_prev * eph_l_new + (1 - eph_g_prev) * (1 - eph_l_new))
+        denom = np.clip(denom, 1e-12, None)
+        eph_g_coexist = (eph_g_prev * eph_l_new) / denom
+        return eph_g_coexist
 
 
     def _update_global_eph_deleted(self, pts_deleted, overlap=True):
-        eph_g_deleted = []
-        if overlap:
-            gamma_deleted_overlap = self._calc_objectness_factor(pts_deleted)
-            for idx, point in enumerate(tqdm(pts_deleted, 
-                                             desc="Updating \u03B5_g (Deleted, Overlap)", ncols=100)):
-                _, prev_idx = self.lifelong_map.kdtree.query(point)
-                eph_g_prev = self.lifelong_map.eph[prev_idx]
-                gamma = gamma_deleted_overlap[idx]
-                eph_g_new = (
-                    (eph_g_prev * gamma) /
-                    (eph_g_prev * gamma + (1 - eph_g_prev) * (1 - gamma))
-                )# Eq. 9
-                eph_g_deleted.append(eph_g_new)
+        if overlap: 
+            if len(pts_deleted) == 0:
+                eph_g_deleted= np.zeros(0, dtype=np.float32)
+            
+            else:
+                gamma_del = self._calc_objectness_factor(pts_deleted)
+                eph_g_prev = self.lifelong_map.eph[self.deleted_overlap_prev_idx]
+
+                denom = (eph_g_prev * gamma_del + (1 - eph_g_prev) * (1 - gamma_del))
+                denom = np.clip(denom, 1e-12, None)
+                eph_g_deleted = (eph_g_prev * gamma_del) / denom
+
         else: # non-overlap
-            for point in tqdm(pts_deleted,
-                            desc="Updating \u03B5_g (Deleted, Non-Overlap)", ncols=100):
-                _, prev_idx = self.lifelong_map.kdtree.query(point)
-                eph_g_prev = self.lifelong_map.eph[prev_idx]
-                eph_g_deleted.append(eph_g_prev) # unchanged
+            eph_g_deleted = self.lifelong_map.eph[self.deleted_nonoverlap_prev_idx] \
+                               if len(self.deleted_nonoverlap_prev_idx) > 0 else np.zeros(0, dtype=np.float32)
         return np.asarray(eph_g_deleted)
 
 
     def _update_global_eph_emerged(self, pts_emerged, overlap=True):
-        eph_g_emerged = []
         if overlap:
-            gamma_emerged_overlap = self._calc_objectness_factor(pts_emerged)
-            for idx, point in enumerate(tqdm(pts_emerged, 
-                                             desc="Updating \u03B5_g (Emerged, Overlap)", ncols=100)):
-                _, new_idx = self.new_session_map.kdtree.query(point)
-                eph_l_new = self.new_session_map.eph[new_idx]
-                gamma = gamma_emerged_overlap[idx]
-                eph_g_new = self.uncertainty_factor * (2 - gamma) * eph_l_new
-                eph_g_emerged.append(eph_g_new)
+            if pts_emerged is None or len(pts_emerged) == 0:
+                eph_g_emerged = np.zeros(0, dtype=np.float32)
+            else: 
+                gamma_emg = self._calc_objectness_factor(pts_emerged)
+                eph_l_new = self.new_session_map.eph[self.emerged_overlap_new_idx]
+                eph_g_merged = self.uncertainty_factor * (2.0 - gamma_emg) * eph_l_new
+
         else: # non-overlap
-            for point in tqdm(pts_emerged,
-                            desc="Updating \u03B5_g (Emerged, Non-Overlap)", ncols=100):
-                _, new_idx = self.new_session_map.kdtree.query(point)
-                eph_l_new = self.new_session_map.eph[new_idx]
-                eph_g_emerged.append(eph_l_new)
-        return np.asarray(eph_g_emerged)
+            eph_g_emerged = self.new_session_map.eph[self.emerged_nonoverlap_new_idx] \
+                               if len(self.emerged_nonoverlap_new_idx) > 0 else np.zeros(0, dtype=np.float32)
+        return eph_g_emerged 
 
 
     def _remove_dynamic_points(self, points: np.ndarray, eph: np.ndarray):
-        if len(points) == 0:
+        if points is None or len(points) == 0:
             return points, eph
         criteria = np.where(eph < self.global_eph_threshold, True, False)
         return points[criteria], eph[criteria]
