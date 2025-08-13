@@ -4,53 +4,9 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import KDTree
 from tqdm import tqdm
-import torch
 import faiss
-import pyflann
 
 from utils.session_map import SessionMap
-
-class FastKDTree:
-    def __init__(self, data, num_trees=8, checks=64):
-        # 입력이 torch면 numpy로 변환
-        if isinstance(data, torch.Tensor):
-            data = data.detach().cpu().numpy()
-        self.flann = pyflann.FLANN()
-        self.data = np.asarray(data, dtype=np.float32)
-        # kdtree 여러 개로 근사 정확도 높이기
-        self.params = self.flann.build_index(self.data, algorithm="kdtree", trees=num_trees)
-        self.checks = checks
-
-    def query(self, points, k=1):
-        # 1) remember original device only if torch input
-        orig_device = None
-        if isinstance(points, torch.Tensor):
-            orig_device = points.device
-            points = points.detach().cpu().numpy()
-        points = np.asarray(points, dtype=np.float32)
-
-        # 2) flann query -> returns (idxs, d2)
-        idxs, d2 = self.flann.nn_index(points, k, checks=self.checks)
-
-        # 3) ensure 2D shape (N, k)
-        if d2.ndim == 1 and k == 1:
-            d2 = d2[:, None]
-            idxs = idxs[:, None]
-
-        # 4) if metric is L2 (squared), convert to Euclidean distance
-        #    -> keep a flag in your class like self.squared = True if using L2
-        if getattr(self, "squared", True):
-            d = np.sqrt(np.maximum(d2, 0.0, dtype=np.float32)).astype(np.float32)
-        else:
-            d = d2.astype(np.float32)
-
-        if orig_device is not None:
-            return (
-                torch.as_tensor(d, device=orig_device, dtype=torch.float32),
-                torch.as_tensor(idxs, device=orig_device, dtype=torch.int64)
-            )
-        return d, idxs
-
 
 class MapUpdater():
     def __init__(
@@ -75,10 +31,42 @@ class MapUpdater():
         self.new_session_map : SessionMap = None
 
 
+        # Global FAISS indices (lifelong vs new session)
+        self.faiss_prev = None  # for lifelong_map
+        self.faiss_new  = None  # for new_session_map
+
     def load(self, lifelong_map: SessionMap, new_session_map: SessionMap):
         self.lifelong_map = lifelong_map
         self.new_session_map = new_session_map
 
+    def _build_global_faiss(self):
+        # Flat L2 for exact KNN on 3D points
+        self.faiss_prev = faiss.IndexFlatL2(3)
+        self.faiss_new = faiss.IndexFlatL2(3)
+        self.faiss_prev.add(self.lifelong_map.map.astype('float32'))
+        self.faiss_new.add(self.new_session_map.map.astype('float32'))
+
+    @staticmethod
+    def _build_local_faiss_index(points: np.ndarray, m: int = 32):
+        # HNSW for faster local overlap checks on coexist set
+        if points is None or points.size == 0:
+            return None
+        index = faiss.IndexHNSWFlat(3, m)
+        index.add(points.astype('float32'))
+        return index
+
+    @staticmethod
+    def _faiss_knn_with(index, queries: np.ndarray, k: int = 1):
+        if queries is None or queries.size == 0:
+            # shape-safe empty
+            return np.empty((0, k), dtype=np.float32), np.empty((0, k), dtype=np.int64)
+        if index is None:
+            # coexist가 비었으면 분류 시 전부 non-overlap로 빠지게 됨
+            n = len(queries)
+            return np.full((n, k), np.inf, dtype=np.float32), np.full((n, k), -1, dtype=np.int64)
+        d2, idx = index.search(queries.astype('float32'), k)
+        d = np.sqrt(d2).astype(np.float32)
+        return d, idx
 
     #이거 토치로 바로 쌓을수도? 일단 모듈 각각에서 토치로 만들고 나중에 session 로더에서 인풋자체를 한번에 토치로 바꾸면될듯
     def _get_merged_map(self):
@@ -92,56 +80,50 @@ class MapUpdater():
 
 
     def classify_map_points(self):
+        
+        #1) load map, build fiass idx
+        merged_map = self._get_merged_map(as_tensor=False).astype('float32')
 
-        prev_dists, prev_idx = self.lifelong_map.kdtree.query(merged_map)
-        new_dists,  new_idx  = self.new_session_map.kdtree.query(merged_map)
+        if self.faiss_prev is None or self.faiss_new is None:
+            self._build_global_faiss()
 
 
+        # 1-1) knn query
+        prev_dists2, prev_idx = self.faiss_prev.search(merged_map, k=1)
+        new_dists2,  new_idx  = self.faiss_new.search(merged_map, k=1)
 
-        # Classify points in the merged map into coexist, deleted, and emerged
-        merged_map = self._get_merged_map()
-        for point in tqdm(merged_map, desc="Point Classification (M_t)", ncols=100):
-            prev_dist, _ = self.lifelong_map.kdtree.query(point)
-            new_dist, _ = self.new_session_map.kdtree.query(point)
-            if prev_dist < self.coexist_threshold and new_dist < self.coexist_threshold:
-                pts_coexist.append(point)
-            elif prev_dist < self.coexist_threshold:
-                pts_deleted.append(point)
-            elif new_dist < self.coexist_threshold:
-                pts_emerged.append(point)
+        prev_dists = np.sqrt(prev_dists2).ravel()
+        new_dists = np.sqrt(new_dists2).ravel()
+
+        #2) 
+        prev_close = prev_dists<self.coexist_threshold
+        new_close = new_dists<self.coexist_threshold
+
+        mask_coexist =  prev_close &  new_close
+        mask_deleted =  prev_close & ~new_close
+        mask_emerged = ~prev_close &  new_close
+
+        pts_coexist = merged_map[mask_coexist]
+        pts_deleted = merged_map[mask_deleted]
+        pts_emerged = merged_map[mask_emerged]
+
         pts_coexist = np.array(pts_coexist)
-        kdtree_coexist = KDTree(pts_coexist)
 
-        # Classify deleted and emerged points into overlap and non-overlap
-        pts_deleted_overlap = []
-        pts_deleted_nonoverlap = []
-        for point in tqdm(pts_deleted, desc="Point Classification (D_t)", ncols=100):
-            dist, _ = kdtree_coexist.query(point)
-            if dist < self.overlap_threshold:
-                pts_deleted_overlap.append(point)
-            else:
-                pts_deleted_nonoverlap.append(point)
-        pts_deleted_overlap = np.array(pts_deleted_overlap)
-        pts_deleted_nonoverlap = np.array(pts_deleted_nonoverlap)
+        #3) overlap vs non_overlap among coexist
+        coexist_index = self._build_local_faiss_index(pts_coexist, m=32)
 
-        # Classify emerged points into overlap and non-overlap
-        pts_emerged_overlap = []
-        pts_emerged_nonoverlap = []
-        for point in tqdm(pts_emerged, desc="Point Classification (E_t)", ncols=100):
-            dist, _ = kdtree_coexist.query(point)
-            if dist < self.overlap_threshold:
-                pts_emerged_overlap.append(point)
-            else:
-                pts_emerged_nonoverlap.append(point)
-        pts_emerged_overlap = np.array(pts_emerged_overlap)
-        pts_emerged_nonoverlap = np.array(pts_emerged_nonoverlap)
+        dist_del, _ = self.faiss_knn_with(coexist_index, pts_deleted)
+        dist_emg, _ = self.faiss_knn_with(coexist_index, pts_emerged)
+
+        mask_del_overlap = dist_del.ravel()<self.overlap_threshold
+        mask_emg_overlap = dist_emg.ravel()<self.overlap_threshold
 
         return {
             "pts_coexist": pts_coexist,
-            "pts_deleted_overlap": pts_deleted_overlap,
-            "pts_deleted_nonoverlap": pts_deleted_nonoverlap,
-            "pts_emerged_overlap": pts_emerged_overlap,
-            "pts_emerged_nonoverlap": pts_emerged_nonoverlap,
+            "pts_deleted_overlap": pts_deleted[mask_del_overlap],
+            "pts_deleted_nonoverlap": pts_deleted[~mask_del_overlap],
+            "pts_emerged_overlap": pts_emerged[mask_emg_overlap],
+            "pts_emerged_nonoverlap": pts_emerged[~mask_emg_overlap],
         }
 
 

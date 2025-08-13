@@ -189,9 +189,6 @@ class MapRemover:
         eph_l = torch.zeros(session_map_tensor.shape[0], device=session_map_tensor.device)
         logger.info(f"Initialized session map")
 
-        # 2) Select anchor points for local ephemerality update
-        tpcd_map = o3d.t.geometry.PointCloud()
-
         anchor_points_tensor = downsample_points_torch(session_map_tensor, p_dor["anchor_voxel_size"])
         num_anchor_points = anchor_points_tensor.shape[0]
 
