@@ -5,8 +5,25 @@ import open3d as o3d
 from scipy.spatial import KDTree
 from tqdm import tqdm
 import faiss
-
+import gc
+from utils.logger import logger
+import psutil
 from utils.session_map import SessionMap
+
+def log_mem(stage):
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / (1024 ** 2)
+    logger.info(f"[MEM] {stage}: {mem_mb:.2f} MB")
+
+def save_chunks(self, point_chunks, eph_chunks):
+    os.makedirs(self.params["settings"]["output_dir"], exist_ok=True)
+    map_path = os.path.join(self.params["settings"]["output_dir"], "map.bin")
+    eph_path = os.path.join(self.params["settings"]["output_dir"], "eph.bin")
+
+    with open(map_path, "wb") as fm, open(eph_path, "wb") as fe:
+        for pts, eph in zip(point_chunks, eph_chunks):
+            np.asarray(pts, dtype=np.float32).tofile(fm)
+            np.asarray(eph, dtype=np.float32).tofile(fe)
 
 class MapUpdater():
     def __init__(
@@ -43,13 +60,23 @@ class MapUpdater():
         self.emerged_overlap_new_idx = None
         self.emerged_nonoverlap_new_idx = None
 
+    def _build_faiss_index(self, points: np.ndarray, m: int = 32, ef_construction: int = 80, ef_search: int = 64):
+        pts = np.ascontiguousarray(points, dtype=np.float32)
+        index = faiss.IndexHNSWFlat(3, m)
+        index.hnsw.efConstruction = ef_construction
+        index.hnsw.efSearch = ef_search
+        try:
+            faiss.omp_set_num_threads(os.cpu_count())
+        except Exception:
+            pass
+        index.add(pts)
+        return index
 
-    def load(self, lifelong_map: SessionMap, new_session_map: SessionMap):
+    def load(self, lifelong_map, new_session_map):
         self.lifelong_map = lifelong_map
         self.new_session_map = new_session_map
-        self.lifelong_map.build_faiss_index(m=32, ef_construction=80, ef_search=64)
-        self.new_session_map.build_faiss_index(m=32, ef_construction=80, ef_search=64)
-
+        self.faiss_prev = self._build_faiss_index(self.lifelong_map.map, m=32, ef_construction=80, ef_search=64)
+        self.faiss_new  = self._build_faiss_index(self.new_session_map.map, m=32, ef_construction=80, ef_search=64)
 
     def _build_global_faiss(self):
         # Flat L2 for exact KNN on 3D points
@@ -98,23 +125,26 @@ class MapUpdater():
 
 
     def classify_map_points(self):
-        
-        #1) load map, build fiass idx
+        logger.info("[classify_map_points] Start")
+
+        # 1) load map, build faiss idx
         merged_map = self._get_merged_map()
-        merged_f32 = np.ascontiguousarray(merged_map, dtype=np.float32) 
+        logger.info(f"[classify_map_points] merged_map shape: {merged_map.shape}")
+        merged_f32 = np.ascontiguousarray(merged_map, dtype=np.float32)
 
         if self.faiss_prev is None or self.faiss_new is None:
+            logger.info("[classify_map_points] Building global FAISS index")
             self._build_global_faiss()
 
-
         # 1-1) knn query
-        prev_d2, prev_idx = self.lifelong_map.faiss_knn_np(merged_f32, k=1)  # CHANGED
-        new_d2,  new_idx  = self.new_session_map.faiss_knn_np(merged_f32, k=1)  # CHANGED
+        logger.info("[classify_map_points] Running KNN queries")
+        prev_d2, prev_idx = self.faiss_prev.search(merged_f32, 1)
+        new_d2,  new_idx  = self.faiss_new.search(merged_f32, 1)
         prev_idx = prev_idx.ravel()
         new_idx  = new_idx.ravel()
+        logger.info(f"[classify_map_points] KNN done. prev_idx size: {prev_idx.size}, new_idx size: {new_idx.size}")
 
-
-        #2) 
+        # 2) threshold masks
         th2 = float(self.coexist_threshold) * float(self.coexist_threshold)
         prev_close = (prev_d2.ravel() < th2)
         new_close  = (new_d2.ravel()  < th2)
@@ -123,16 +153,19 @@ class MapUpdater():
         mask_deleted =  prev_close & ~new_close
         mask_emerged = ~prev_close &  new_close
 
+        logger.info(f"[classify_map_points] mask_coexist: {mask_coexist.sum()}, "
+                    f"mask_deleted: {mask_deleted.sum()}, mask_emerged: {mask_emerged.sum()}")
+
         pts_coexist = merged_map[mask_coexist]
         pts_deleted = merged_map[mask_deleted]
         pts_emerged = merged_map[mask_emerged]
 
-        pts_coexist = np.array(pts_coexist)
+        logger.info(f"[classify_map_points] pts_coexist: {pts_coexist.shape}, "
+                    f"pts_deleted: {pts_deleted.shape}, pts_emerged: {pts_emerged.shape}")
 
-
-        #3) overlap vs non_overlap among coexist
-        coexist_index = self._build_local_faiss_index(pts_coexist, m=32, ef_search=64)  # CHANGED
-
+        # 3) overlap vs non_overlap among coexist
+        coexist_index = self._build_local_faiss_index(pts_coexist, m=32, ef_search=64)
+        logger.info("[classify_map_points] Built local FAISS index for coexist points")
 
         del_d2, _ = self._faiss_knn_with(coexist_index, pts_deleted)
         emg_d2, _ = self._faiss_knn_with(coexist_index, pts_emerged)
@@ -140,8 +173,11 @@ class MapUpdater():
         ovl2 = float(self.overlap_threshold) * float(self.overlap_threshold)
         mask_del_overlap = del_d2.ravel() < ovl2
         mask_emg_overlap = emg_d2.ravel() < ovl2
-        
-        #cache ----------
+
+        logger.info(f"[classify_map_points] mask_del_overlap: {mask_del_overlap.sum()}, "
+                    f"mask_emg_overlap: {mask_emg_overlap.sum()}")
+
+        # cache ----------
         coexist_prev_idx = prev_idx[mask_coexist]
         coexist_new_idx  = new_idx[mask_coexist]
         deleted_prev_idx = prev_idx[mask_deleted]
@@ -153,10 +189,7 @@ class MapUpdater():
         self.deleted_nonoverlap_prev_idx = deleted_prev_idx[~mask_del_overlap]
         self.emerged_overlap_new_idx     = emerged_new_idx[mask_emg_overlap]
         self.emerged_nonoverlap_new_idx  = emerged_new_idx[~mask_emg_overlap]
-        
-        #cache -----------------
-
-
+        logger.info("[classify_map_points] Cached index arrays")
 
         return {
             "pts_coexist": pts_coexist,
@@ -165,6 +198,7 @@ class MapUpdater():
             "pts_emerged_overlap": pts_emerged[mask_emg_overlap],
             "pts_emerged_nonoverlap": pts_emerged[~mask_emg_overlap],
         }
+
 
 
     def update_global_ephemerality(self, classified_points: dict = None):
@@ -264,26 +298,65 @@ class MapUpdater():
 
 
     def run(self):
+        logger.info("[RUN] classify_map_points() 시작")
         classified_points = self.classify_map_points()
-        global_ephemerality = self.update_global_ephemerality(classified_points)
-        updated_map = np.vstack((classified_points["pts_coexist"],
-                                 classified_points["pts_deleted_overlap"],
-                                 classified_points["pts_deleted_nonoverlap"],
-                                 classified_points["pts_emerged_overlap"],
-                                 classified_points["pts_emerged_nonoverlap"]))
-        updated_eph = np.hstack((global_ephemerality["eph_g_coexist"],
-                                 global_ephemerality["eph_g_deleted_overlap"],
-                                 global_ephemerality["eph_g_deleted_nonoverlap"],
-                                 global_ephemerality["eph_g_emerged_overlap"],
-                                 global_ephemerality["eph_g_emerged_nonoverlap"]))
+        log_mem("After classify_map_points")
+
+        logger.info("[RUN] update_global_ephemerality() 시작")
+        global_ephemerality = self.update_global_ephemerality(classified_points)    
+        log_mem("After update_global_ephemerality")
+
+        logger.info("[RUN] updated_map / updated_eph 병합 시작")
+        updated_map = np.vstack((
+            classified_points["pts_coexist"],
+            classified_points["pts_deleted_overlap"],
+            classified_points["pts_deleted_nonoverlap"],
+            classified_points["pts_emerged_overlap"],
+            classified_points["pts_emerged_nonoverlap"]
+        ))
+        updated_eph = np.hstack((
+            global_ephemerality["eph_g_coexist"],
+            global_ephemerality["eph_g_deleted_overlap"],
+            global_ephemerality["eph_g_deleted_nonoverlap"],
+            global_ephemerality["eph_g_emerged_overlap"],
+            global_ephemerality["eph_g_emerged_nonoverlap"]
+        ))
+        log_mem("After stack updated_map/updated_eph")
+
         if self.remove_dynamic_points:
+            logger.info("[RUN] remove_dynamic_points 적용")
             updated_map, updated_eph = self._remove_dynamic_points(updated_map, updated_eph)
+            log_mem("After remove_dynamic_points")
+
         if self.remove_outlier_points:
+            logger.info("[RUN] remove_outlier_points 적용")
             updated_map, updated_eph = self._remove_outlier_points(updated_map, updated_eph)
-        updated_lifelong_map = SessionMap(updated_map, updated_eph)
-        self.save(updated_lifelong_map)
+            log_mem("After remove_outlier_points")
+
+        logger.info("[RUN] npy 임시 저장 시작")
+        map_path = os.path.join(self.params["settings"]["output_dir"], "map.npy")
+        eph_path = os.path.join(self.params["settings"]["output_dir"], "eph.npy")
+
+        os.makedirs(os.path.dirname(map_path), exist_ok=True)
+        os.makedirs(os.path.dirname(eph_path), exist_ok=True)
+        np.save(map_path, updated_map.astype(np.float32))
+        np.save(eph_path, updated_eph.astype(np.float32))
+        log_mem("After np.save()")
+
+        logger.info("[RUN] updated_map / updated_eph 메모리 해제")
+        del updated_map
+        del updated_eph
+        gc.collect()
+        log_mem("After gc.collect()")
+
+        logger.info("[RUN] mmap으로 다시 로드")
+        loaded_map = np.load(map_path, mmap_mode='r')
+        loaded_eph = np.load(eph_path, mmap_mode='r')
+        updated_lifelong_map = SessionMap(loaded_map, loaded_eph)
+        log_mem("After SessionMap 생성")
+
+        logger.info("[RUN] 완료")
         return updated_lifelong_map
     
-
     def save(self, lifelong_map: SessionMap):
         lifelong_map.save(self.params["settings"]["output_dir"], is_global=True)

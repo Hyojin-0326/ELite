@@ -3,6 +3,9 @@ settings:
   poses_file: "./data/parkinglot/01/poses.txt"
   calib_path: ""
   output_dir: "./data/parkinglot/01/outputs"
+  cache_dir: "./cache"
+  output_dir: /home/hjkwon/Desktop/Elite_fork/ELite/data/parkinglot/02/outputs
+  prev_output_dir: /home/hjkwon/Desktop/Elite_fork/ELite/data/parkinglot/01/outputs
 
 
 alignment:

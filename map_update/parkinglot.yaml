@@ -4,7 +4,6 @@ settings:
   calib_path: ""
   output_dir: "./data/parkinglot/02/outputs"
   prev_output_dir: "./data/parkinglot/01/outputs"
-  cache_dir: "./cache"
 
 
 alignment:

@@ -73,14 +73,10 @@ class PointCloud:
         return self
     
     def save(self, path: str) -> 'PointCloud':
-        tpcd = o3d.t.geometry.PointCloud.from_legacy(self.cloud).cuda()
-        z = tpcd.point["positions"][:, 2]  # GPU Tensor
-        z_min = z.min()
-        z_max = z.max()
-        inten = (z - z_min) / (z_max - z_min + 1e-8)
-        tpcd.point["colors"] = inten.unsqueeze(1).repeat(1, 3)
-        legacy = tpcd.to_legacy()
-        o3d.io.write_point_cloud(path, legacy)
+        z = np.asarray(self.cloud.points)[:, 2]
+        inten = (z - z.min()) / (z.max() - z.min() + 1e-8)
+        self.cloud.colors = o3d.utility.Vector3dVector(np.c_[inten, inten, inten])
+        o3d.io.write_point_cloud(path, self.cloud)
         return self
 
     def get(self) -> o3d.geometry.PointCloud:
@@ -211,9 +207,3 @@ class Session:
                 poses.append(np.vstack([mat, [0,0,0,1]]))
         return poses
 
-    def save_legacy(self, path: str) -> 'PointCloud':
-        z = np.asarray(self.cloud.points)[:, 2]
-        inten = (z - z.min()) / (z.max() - z.min() + 1e-8)
-        self.cloud.colors = o3d.utility.Vector3dVector(np.c_[inten, inten, inten])
-        o3d.io.write_point_cloud(path, self.cloud)
-        return self

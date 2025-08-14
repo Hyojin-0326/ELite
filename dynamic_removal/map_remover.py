@@ -3,7 +3,6 @@ import yaml
 import numpy as np
 import open3d as o3d
 from tqdm import trange
-from scipy.spatial import KDTree
 import torch
 import open3d.core as o3c
 import torch.utils.dlpack

@@ -3,7 +3,9 @@ import copy
 import yaml
 import numpy as np
 import open3d as o3d
+import faiss
 from tqdm import tqdm
+import torch
 
 from utils.session import Session
 from utils.session_map import SessionMap
@@ -29,6 +31,41 @@ class MapZipper:
         
         self.source_session = None
         self.tgt_session_map = None
+    
+
+    def build_faiss_index_from_poses(self):
+        poses = self.tgt_session_map.get_poses()
+        if len(poses) == 0:
+            raise ValueError("Target session map has no poses.")
+
+        positions_np = np.vstack([pose[:3, 3] for pose in poses]).astype(np.float32)  # (N,3)
+
+        dim, m = 3, 32
+        self.faiss_index = faiss.IndexHNSWFlat(dim, m)  # CPU HNSW
+        self.faiss_index.add(positions_np)
+        logger.info(f"Built FAISS HNSW index (poses) with {positions_np.shape[0]} anchors")
+
+    def build_faiss_index_for_points(self, merged_tgt: o3d.geometry.PointCloud):
+        pts = np.asarray(merged_tgt.points, dtype=np.float32)
+        self._tgt_pts_np = pts                                 # 크롭 결과 만들 때 재사용
+        dim, m = 3, 32
+        self.faiss_index_pts = faiss.IndexHNSWFlat(dim, m)
+        # (선택) 리콜/속도 튜닝
+        try:
+            self.faiss_index_pts.hnsw.efConstruction = 80
+            self.faiss_index_pts.hnsw.efSearch = 64
+        except Exception:
+            pass
+        self.faiss_index_pts.add(pts)
+        logger.info(f"Built FAISS HNSW index (points) with {pts.shape[0]} points")
+
+    def faiss_knn(self, queries_np: np.ndarray, k: int):
+        """
+        queries_np: (Q,3) float32 numpy array
+        return: (dists, idx) as numpy arrays
+        """
+        dists, idx = self.faiss_index.search(queries_np.astype('float32'), k)
+        return dists, idx
 
     def load_target_session_map(self, tgt_session_map: SessionMap=None):
         p_settings = self.params["settings"]
@@ -59,12 +96,48 @@ class MapZipper:
                 raise TypeError("src_session must be an instance of Session")
         self.src_session = src_session
 
-    def _crop(self, pcd: o3d.geometry.PointCloud, center: np.ndarray, radius: float):
+    def _crop_legacy(self, pcd: o3d.geometry.PointCloud, center: np.ndarray, radius: float):
         min_b = center - radius
         max_b = center + radius
         aabb = o3d.geometry.AxisAlignedBoundingBox(min_b, max_b)
         return pcd.crop(aabb)
+    
+    def _crop(self, center, radius: float) -> o3d.geometry.PointCloud:
+        if not hasattr(self, "faiss_index_pts"):
+            raise RuntimeError("Call build_faiss_index_for_points() first.")
+          # (1) 쿼리 준비
+        if isinstance(center, torch.Tensor):
+            q = center.detach().cpu().numpy().astype(np.float32, copy=False).reshape(1, 3)
+        else:
+            q = np.asarray(center, dtype=np.float32).reshape(1, 3)
+        r2 = radius * radius
 
+        # (2) 반경 질의
+        idx = None
+        if hasattr(self.faiss_index_pts, "range_search"):
+            lims, D, I = self.faiss_index_pts.range_search(q, r2)
+            idx = I[lims[0]:lims[1]]
+        else:
+            # fallback: 큰 k로 KNN 후 반경 필터 (동적으로 k 확장)
+            N = self._tgt_pts_np.shape[0]
+            k = min(2048, N)
+            while True:
+                Dk, Ik = self.faiss_index_pts.search(q, k)
+                mask = Dk[0] <= r2
+                count = int(mask.sum())
+                if count < k or k >= N:
+                    idx = Ik[0][mask]
+                    break
+                k = min(k * 2, N)
+
+        # (3) 결과 포인트클라우드 만들기
+        if idx is None or idx.size == 0:
+            return o3d.geometry.PointCloud()
+        pcd_crop = o3d.geometry.PointCloud()
+        pcd_crop.points = o3d.utility.Vector3dVector(self._tgt_pts_np[idx])
+        return pcd_crop
+
+        
     def _init_transform(self) -> np.ndarray:
         p = self.params["alignment"]
         init_tf = np.eye(4)
@@ -72,7 +145,7 @@ class MapZipper:
             init_tf = np.array(p["init_transform"]).reshape(4, 4)
         return init_tf
 
-    def _is_nonoverlapping(self, point: np.ndarray, threshold: float) -> bool:
+    def _is_nonoverlapping_legacy(self, point: np.ndarray, threshold: float) -> bool:
         # Nearest-neighbor distance test
         tgt_session_map_poses = self.tgt_session_map.get_poses()
         if len(tgt_session_map_poses) == 0:
@@ -82,6 +155,25 @@ class MapZipper:
         kdtree.set_matrix_data(positions.T)
         _, idx, _ = kdtree.search_knn_vector_3d(point, 1)
         return np.linalg.norm(positions[idx] - point) > threshold
+    
+
+    def _is_nonoverlapping(self, query, threshold: float) -> bool:
+        """
+        query: np.ndarray (3,) or torch.Tensor (3,)
+        threshold: meters. FAISS L2는 '제곱거리' 반환하므로 threshold^2와 비교.
+        """
+        if not hasattr(self, 'faiss_index'):
+            raise RuntimeError("FAISS index not built. Call build_faiss_index_from_poses() first.")
+
+        if isinstance(query, torch.Tensor):
+            q = query.detach().cpu().numpy().astype(np.float32).reshape(1, 3)
+        else:
+            q = np.asarray(query, dtype=np.float32).reshape(1, 3)
+
+        dists, _ = self.faiss_index.search(q, 1)   # (1,1) 제곱 L2 거리
+        return float(dists[0, 0]) > (threshold * threshold)
+        
+
 
     def _update_poses_from(self, start: int, transform: np.ndarray, reverse: bool):
         rng = (range(start, -1, -1) if reverse 
@@ -147,6 +239,8 @@ class MapZipper:
         # pre-merge target once
         merged_tgt = self.tgt_session_map.get()
         merged_tgt = merged_tgt.voxel_down_sample(p["tgt_voxel_size"])
+        self.build_faiss_index_for_points(merged_tgt)
+        self.build_faiss_index_from_poses() 
 
         # scan loop
         desc = "Forward" if not reverse else "Reverse"
@@ -155,13 +249,14 @@ class MapZipper:
         idxs = range(len(self.src_session))
         idxs = [i for i in reversed(idxs)] if reverse else idxs
         for i in tqdm(idxs, desc=f"Alignment ({desc})", ncols=100):
-            src_pc = self.src_session[i].downsample(p["src_voxel_size"]).get()
+
+            src_pc = self.src_session[i].downsample(p["src_voxel_size"]).get() 
             query = self.src_session.get_pose(i)[:3, 3]
-            tgt_crop = self._crop(merged_tgt, query, p.get("crop_radius", 100.0))
+            tgt_crop = self._crop(query, p.get("crop_radius", 100.0))
 
             if self._is_nonoverlapping(query, p.get("non_overlap_threshold", 10.0)):
                 logger.debug(f"Scan {i} non-overlapping; skipping")
-                tf_pc = copy.deepcopy(src_pc)
+                # tf_pc = copy.deepcopy(src_pc)
             else:
                 maxd = p["gicp_max_correspondence_distance"]
                 if reverse:
@@ -171,7 +266,7 @@ class MapZipper:
                 matcher.set_input_tgt(tgt_crop)
                 matcher.align()
                 tf = matcher.get_final_transformation()
-                tf_pc = copy.deepcopy(src_pc).transform(tf)
+                # tf_pc = copy.deepcopy(src_pc).transform(tf)
                 self._update_poses_from(i, tf, reverse)
                 fit, rmse = matcher.get_registration_result()
                 logger.debug(f"Scan {i}: fit={fit:.2f}, rmse={rmse:.2f}")
