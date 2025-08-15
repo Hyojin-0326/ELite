@@ -4,7 +4,6 @@ import yaml
 import numpy as np
 import open3d as o3d
 from tqdm import tqdm
-import faiss
 
 from utils.session import Session
 from utils.session_map import SessionMap
@@ -31,16 +30,6 @@ class MapZipper:
         self.source_session = None
         self.tgt_session_map = None
 
-        #KNN cache
-        self._tgt_pose_np = None
-        self._tgt_pose_hnsw = None
-
-        #optimized pose update when reverse
-        self._base_poses = None    
-        self._tf_steps = []       
-        self._P = None            
-
-
     def load_target_session_map(self, tgt_session_map: SessionMap=None):
         p_settings = self.params["settings"]
         prev_output_dir = p_settings["prev_output_dir"]
@@ -56,14 +45,6 @@ class MapZipper:
             if not isinstance(tgt_session_map, SessionMap):
                 raise TypeError("tgt_session_map must be an instance of SessionMap")
         self.tgt_session_map = tgt_session_map
-
-        #build faiss idx
-        poses = self.tgt_session_map.get_poses()
-        self._tgt_pose_np = np.vstack([p[:3, 3] for p in poses]).astype(np.float32)
-        dim, m = 3, 32
-        self._tgt_pose_hnsw = faiss.IndexHNSWFlat(dim, m)
-        self._tgt_pose_hnsw.hnsw.efSearch = 64     # 필요시 튜닝
-        self._tgt_pose_hnsw.add(self._tgt_pose_np)
     
     def load_source_session(self, src_session: Session=None):
         p_settings = self.params["settings"]
@@ -77,39 +58,6 @@ class MapZipper:
             if not isinstance(src_session, Session):
                 raise TypeError("src_session must be an instance of Session")
         self.src_session = src_session
-
-        #init self.base_poses
-        self._base_poses = np.stack([
-            self.src_session.get_pose(i)
-            for i in range(len(self.src_session))
-            ]).astype(np.float32)
-
-        self._P = np.eye(4, dtype=np.float32)
-        self._tf_steps.clear()
-
-    def _current_pose_of(self, i: int) -> np.ndarray:
-        """현재 누적변환 P를 적용한 i번째 포즈"""
-        return (self._P @ self._base_poses[i]).astype(np.float32)
-
-    def _record_step_tf(self, tf: np.ndarray):
-        """정렬 결과 TF를 기록하고 누적"""
-        tf = tf.astype(np.float32)
-        self._tf_steps.append(tf)
-        self._P = tf @ self._P
-
-    def _write_final_poses(self, out_path: str):
-        N = len(self._base_poses)
-        T = np.eye(4, dtype=np.float32)
-        final_poses = self._base_poses.copy()
-        for i, tf in enumerate(self._tf_steps):
-            T = tf @ T
-            final_poses[i:] = (T @ self._base_poses[i:]).astype(np.float32)
-            # 혹시 느리면 아래로 교체 가능:
-            # for j in range(i, N):
-            #     final_poses[j] = T @ self._base_poses[j]
-
-        self.src_session.overwrite_poses(final_poses)  # setter 필요하면 추가
-        self.src_session.save_pose(out_path)
 
     def _crop(self, pcd: o3d.geometry.PointCloud, center: np.ndarray, radius: float):
         min_b = center - radius
@@ -126,10 +74,14 @@ class MapZipper:
 
     def _is_nonoverlapping(self, point: np.ndarray, threshold: float) -> bool:
         # Nearest-neighbor distance test
-        q = point.astype(np.float32).reshape(1,3)
-        D, I = self._tgt_pose_hnsw.search(q, 1)
-        return D[0,0] > threshold*threshold
-
+        tgt_session_map_poses = self.tgt_session_map.get_poses()
+        if len(tgt_session_map_poses) == 0:
+            raise ValueError("Target session map has no poses.")
+        positions = np.vstack([pose[:3, 3] for pose in tgt_session_map_poses])
+        kdtree = o3d.geometry.KDTreeFlann()
+        kdtree.set_matrix_data(positions.T)
+        _, idx, _ = kdtree.search_knn_vector_3d(point, 1)
+        return np.linalg.norm(positions[idx] - point) > threshold
 
     def _update_poses_from(self, start: int, transform: np.ndarray, reverse: bool):
         rng = (range(start, -1, -1) if reverse 
@@ -220,16 +172,14 @@ class MapZipper:
                 matcher.align()
                 tf = matcher.get_final_transformation()
                 tf_pc = copy.deepcopy(src_pc).transform(tf)
-                self._record_step_tf(tf)
+                self._update_poses_from(i, tf, reverse)
                 fit, rmse = matcher.get_registration_result()
                 logger.debug(f"Scan {i}: fit={fit:.2f}, rmse={rmse:.2f}")
 
             # self._save_iteration(i, tf_pc, reverse) # only for debug
 
         # write final
-        suffix = "rev_" if reverse else ""
-        out_path = os.path.join(p["output_dir"], f"{suffix}final_transform.txt")
-        self._write_final_poses(out_path)
+        self._save_final_transform(reverse)
         logger.info(f"{'Reverse' if reverse else 'Forward'} pass done.")
 
     def run(self):
