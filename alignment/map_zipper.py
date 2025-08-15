@@ -161,7 +161,7 @@ class MapZipper:
 
             if self._is_nonoverlapping(query, p.get("non_overlap_threshold", 10.0)):
                 logger.debug(f"Scan {i} non-overlapping; skipping")
-                tf_pc = copy.deepcopy(src_pc)
+                # tf_pc = copy.deepcopy(src_pc)
             else:
                 maxd = p["gicp_max_correspondence_distance"]
                 if reverse:
@@ -171,7 +171,7 @@ class MapZipper:
                 matcher.set_input_tgt(tgt_crop)
                 matcher.align()
                 tf = matcher.get_final_transformation()
-                tf_pc = copy.deepcopy(src_pc).transform(tf)
+                # tf_pc = copy.deepcopy(src_pc).transform(tf)
                 self._update_poses_from(i, tf, reverse)
                 fit, rmse = matcher.get_registration_result()
                 logger.debug(f"Scan {i}: fit={fit:.2f}, rmse={rmse:.2f}")
