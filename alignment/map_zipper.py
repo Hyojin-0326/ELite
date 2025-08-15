@@ -3,7 +3,6 @@ import copy
 import yaml
 import numpy as np
 import open3d as o3d
-import open3d.core as o3c
 from tqdm import tqdm
 
 from utils.session import Session
@@ -19,9 +18,6 @@ class MapZipper:
         self,
         config_path: str,
     ):
-        #쿠다 o3d용 
-        self.device = o3c.Device("CUDA:0")
-
         # Load parameters and initialize data loaders
         with open(config_path, 'r') as f:
             self.params = yaml.safe_load(f)
@@ -63,13 +59,11 @@ class MapZipper:
                 raise TypeError("src_session must be an instance of Session")
         self.src_session = src_session
 
-    def _crop(pcd_t: o3d.t.geometry.PointCloud, center: np.ndarray, radius: float):
-        device = pcd_t.device
-        center_t = o3c.Tensor(center, dtype=o3c.Dtype.Float32, device=device)
-        min_b = center_t - radius
-        max_b = center_t + radius
-        aabb = o3d.t.geometry.AxisAlignedBoundingBox(min_b, max_b)
-        return pcd_t.crop(aabb)
+    def _crop(self, pcd: o3d.geometry.PointCloud, center: np.ndarray, radius: float):
+        min_b = center - radius
+        max_b = center + radius
+        aabb = o3d.geometry.AxisAlignedBoundingBox(min_b, max_b)
+        return pcd.crop(aabb)
 
     def _init_transform(self) -> np.ndarray:
         p = self.params["alignment"]
@@ -77,23 +71,17 @@ class MapZipper:
         if "init_transform" in p:
             init_tf = np.array(p["init_transform"]).reshape(4, 4)
         return init_tf
-    
+
     def _is_nonoverlapping(self, point: np.ndarray, threshold: float) -> bool:
-        device = self.device
         # Nearest-neighbor distance test
         tgt_session_map_poses = self.tgt_session_map.get_poses()
         if len(tgt_session_map_poses) == 0:
             raise ValueError("Target session map has no poses.")
         positions = np.vstack([pose[:3, 3] for pose in tgt_session_map_poses])
-
-        pcd = o3d.t.geometry.PointCloud(self.device)
-        pcd.point["positions"] = o3c.Tensor(positions, device=self.device)
-
         kdtree = o3d.geometry.KDTreeFlann()
         kdtree.set_matrix_data(positions.T)
         _, idx, _ = kdtree.search_knn_vector_3d(point, 1)
         return np.linalg.norm(positions[idx] - point) > threshold
-
 
     def _update_poses_from(self, start: int, transform: np.ndarray, reverse: bool):
         rng = (range(start, -1, -1) if reverse 
@@ -169,7 +157,7 @@ class MapZipper:
         for i in tqdm(idxs, desc=f"Alignment ({desc})", ncols=100):
             src_pc = self.src_session[i].downsample(p["src_voxel_size"]).get()
             query = self.src_session.get_pose(i)[:3, 3]
-            tgt_crop = self.crop_cuda(merged_tgt, query, p.get("crop_radius", 100.0))
+            tgt_crop = self._crop(merged_tgt, query, p.get("crop_radius", 100.0))
 
             if self._is_nonoverlapping(query, p.get("non_overlap_threshold", 10.0)):
                 logger.debug(f"Scan {i} non-overlapping; skipping")
@@ -224,22 +212,3 @@ if __name__ == "__main__":
     zipper.load_target_session_map()
     zipper.run()
     logger.info("Zipper finished.")  
-
-####Legacy code
-    def _crop_legacy(self, pcd: o3d.geometry.PointCloud, center: np.ndarray, radius: float):
-        min_b = center - radius
-        max_b = center + radius
-        aabb = o3d.geometry.AxisAlignedBoundingBox(min_b, max_b)
-        return pcd.crop(aabb)
-    
-    def _is_nonoverlapping(self, point: np.ndarray, threshold: float) -> bool:
-        # Nearest-neighbor distance test
-        tgt_session_map_poses = self.tgt_session_map.get_poses()
-        if len(tgt_session_map_poses) == 0:
-            raise ValueError("Target session map has no poses.")
-        positions = np.vstack([pose[:3, 3] for pose in tgt_session_map_poses])
-        kdtree = o3d.geometry.KDTreeFlann()
-        kdtree.set_matrix_data(positions.T)
-        _, idx, _ = kdtree.search_knn_vector_3d(point, 1)
-        return np.linalg.norm(positions[idx] - point) > threshold
-
