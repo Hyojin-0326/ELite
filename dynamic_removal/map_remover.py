@@ -3,7 +3,6 @@ import yaml
 import numpy as np
 import open3d as o3d
 from tqdm import trange
-from scipy.spatial import KDTree
 import torch
 import open3d.core as o3c
 import torch.utils.dlpack
@@ -90,48 +89,6 @@ def downsample_points(points, voxel_size: float):
     downsampled = np.asarray(pcd.points)
     return torch.as_tensor(downsampled, device=device, dtype=dtype)
 
-class FastKDTree:
-    def __init__(self, data, num_trees=8, checks=64):
-        # 입력이 torch면 numpy로 변환
-        if isinstance(data, torch.Tensor):
-            data = data.detach().cpu().numpy()
-        self.flann = pyflann.FLANN()
-        self.data = np.asarray(data, dtype=np.float32)
-        # kdtree 여러 개로 근사 정확도 높이기
-        self.params = self.flann.build_index(self.data, algorithm="kdtree", trees=num_trees)
-        self.checks = checks
-
-    def query(self, points, k=1):
-        # 1) remember original device only if torch input
-        orig_device = None
-        if isinstance(points, torch.Tensor):
-            orig_device = points.device
-            points = points.detach().cpu().numpy()
-        points = np.asarray(points, dtype=np.float32)
-
-        # 2) flann query -> returns (idxs, d2)
-        idxs, d2 = self.flann.nn_index(points, k, checks=self.checks)
-
-        # 3) ensure 2D shape (N, k)
-        if d2.ndim == 1 and k == 1:
-            d2 = d2[:, None]
-            idxs = idxs[:, None]
-
-        # 4) if metric is L2 (squared), convert to Euclidean distance
-        #    -> keep a flag in your class like self.squared = True if using L2
-        if getattr(self, "squared", True):
-            d = np.sqrt(np.maximum(d2, 0.0, dtype=np.float32)).astype(np.float32)
-        else:
-            d = d2.astype(np.float32)
-
-        if orig_device is not None:
-            return (
-                torch.as_tensor(d, device=orig_device, dtype=torch.float32),
-                torch.as_tensor(idxs, device=orig_device, dtype=torch.int64)
-            )
-        return d, idxs
-
-
 
 class MapRemover:
     def __init__(
@@ -170,7 +127,7 @@ class MapRemover:
             logger.info(f"Processing scan {i+1}/{self.num_scans}")
             legacy_pcd = self.session_loader[i].get()
             points_np = np.asarray(legacy_pcd.points)
-            logger.info(f"Legacy pcd #{i} has {points_np.shape[0]} points")
+            # logger.info(f"Legacy pcd #{i} has {points_np.shape[0]} points")
 
             # NaN/Inf 체크 (numpy → torch 안 거치고 바로)
             if np.isnan(points_np).any() or np.isinf(points_np).any():
@@ -181,7 +138,7 @@ class MapRemover:
                 tpcd = o3d.t.geometry.PointCloud.from_legacy(legacy_pcd)
                 positions_o3c = tpcd.point["positions"]
                 positions_torch = torch.utils.dlpack.from_dlpack(positions_o3c.to_dlpack()).to(device="cuda", dtype=torch.float32)
-                logger.info(f"Converted to torch tensor: shape={positions_torch.shape}, dtype={positions_torch.dtype}, device={positions_torch.device}")
+                # logger.info(f"Converted to torch tensor: shape={positions_torch.shape}, dtype={positions_torch.dtype}, device={positions_torch.device}")
 
                 self.gpu_scans.append(positions_torch)
             except Exception as e:
@@ -191,7 +148,7 @@ class MapRemover:
             try:
                 pose_np = self.session_loader.get_pose(i)[:3, 3].astype(np.float32)
                 gpu_pose = torch.as_tensor(pose_np, dtype=torch.float32, device='cuda')
-                logger.info(f"Pose #{i}: {gpu_pose.cpu().numpy()}")
+                # logger.info(f"Pose #{i}: {gpu_pose.cpu().numpy()}")
                 self.gpu_poses.append(gpu_pose)
             except Exception as e:
                 logger.error(f"Failed to load pose #{i}: {e}")
@@ -212,13 +169,12 @@ class MapRemover:
         logger.info(f"Built FAISS HNSW index with {anchor_np.shape[0]} points")
 
     def faiss_knn(self, queries: torch.Tensor, k: int):
+        # **쿼리 (GPU→numpy→FAISS→Torch)**
         queries_np = queries.detach().cpu().numpy().astype('float32')
-        d2, idx = self.faiss_index.search(queries_np, k)  # squared L2
-        # sqrt
-        d = np.sqrt(d2, dtype=np.float32)
-        d = torch.as_tensor(d, device=queries.device)
+        dists, idx = self.faiss_index.search(queries_np, k)
+        dists = torch.as_tensor(dists, device=queries.device)
         idx = torch.as_tensor(idx, device=queries.device, dtype=torch.int64)
-        return d, idx
+        return dists, idx
 
 
     def run(self):
@@ -231,9 +187,6 @@ class MapRemover:
         session_map_tensor = torch.cat(self.gpu_scans, dim=0)
         eph_l = torch.zeros(session_map_tensor.shape[0], device=session_map_tensor.device)
         logger.info(f"Initialized session map")
-
-        # 2) Select anchor points for local ephemerality update
-        tpcd_map = o3d.t.geometry.PointCloud()
 
         anchor_points_tensor = downsample_points_torch(session_map_tensor, p_dor["anchor_voxel_size"])
         num_anchor_points = anchor_points_tensor.shape[0]
@@ -392,27 +345,6 @@ class MapRemover:
             print("Saving static and dynamic point clouds.")
             o3d.io.write_point_cloud(os.path.join(p_settings["output_dir"], "static_points.pcd"), static_pcd)  
             o3d.io.write_point_cloud(os.path.join(p_settings["output_dir"], "dynamic_points.pcd"), dynamic_pcd)
-
-        if p_dor["viz_static_dynamic_map"]:
-            print("Visualizing static and dynamic point clouds.")
-            total_points = static_pcd + dynamic_pcd
-            o3d.visualization.draw_geometries([total_points])
-
-        # 세션 맵 업데이트
-        self.session_map = cleaned_session_map
-
-        # 세션 맵 저장 여부 확인
-        if p_dor["save_cleaned_session_map"]:
-            print("Saving cleaned session map.")
-            cleaned_session_map.save(p_settings["output_dir"], is_global=False)
-
-        if p_dor["viz_cleaned_session_map"]:
-            print("Visualizing cleaned session map.")
-            cleaned_session_map.visualize()
-
-        return cleaned_session_map
-
-    def get(self):
         return self.session_map
         
 
