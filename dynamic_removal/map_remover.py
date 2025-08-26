@@ -193,6 +193,7 @@ class MapRemover:
 
         # Update loop
         for i in trange(0, self.num_scans, p_dor["stride"], desc="Updating ε_l", ncols=100):
+            logger.info(f"Processing scan {i+1}/{self.num_scans}")
             scan = self.gpu_scans[i]
             pose = self.gpu_poses[i]
             
