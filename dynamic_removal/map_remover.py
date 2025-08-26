@@ -4,12 +4,8 @@ import numpy as np
 import open3d as o3d
 from tqdm import trange
 import torch
-import open3d.core as o3c
 import torch.utils.dlpack
-import pyflann
 import faiss
-
-import cupy as cp
 from utils.session import Session
 from utils.session_map import SessionMap
 from utils.logger import logger
@@ -182,6 +178,9 @@ class MapRemover:
         p_settings = self.params["settings"]
         p_dor = self.params["dynamic_object_removal"]
 
+        session_map_tensor = torch.cat(self.gpu_scans, dim=0)
+        session_map_tensor = downsample_points_torch(session_map_tensor, 0.01)
+
         # 1) Aggregate scans to create session map
         assert len(self.gpu_scans) > 0, "gpu_scans is empty!"
 
@@ -189,14 +188,16 @@ class MapRemover:
         eph_l = torch.zeros(session_map_tensor.shape[0], device=session_map_tensor.device)
         logger.info(f"Initialized session map")
 
-        # 2) Select anchor points for local ephemerality update
-        tpcd_map = o3d.t.geometry.PointCloud()
-
-        anchor_points_tensor = downsample_points(session_map_tensor, p_dor["anchor_voxel_size"])
+        anchor_points_tensor = downsample_points_torch(session_map_tensor, p_dor["anchor_voxel_size"])
         num_anchor_points = anchor_points_tensor.shape[0]
 
         if num_anchor_points == 0:
             raise RuntimeError("voxel_down_sample() returned empty point cloud! Check voxel size or input data.")
+
+        k_req = int(p_dor["num_k"])
+        k = min(k_req, num_anchor_points)
+        if k < k_req:
+            logger.warning(f"num_k({k_req}) > #anchors({num_anchor_points}) → using k={k}")
 
     
 
@@ -329,6 +330,7 @@ class MapRemover:
             static_points_np,
             static_eph_l_np
         )
+        self.session_map = cleaned_session_map
 
         # 빈 객체 만들기
         static_pcd  = o3d.geometry.PointCloud()
@@ -349,6 +351,10 @@ class MapRemover:
             print("Saving static and dynamic point clouds.")
             o3d.io.write_point_cloud(os.path.join(p_settings["output_dir"], "static_points.pcd"), static_pcd)  
             o3d.io.write_point_cloud(os.path.join(p_settings["output_dir"], "dynamic_points.pcd"), dynamic_pcd)
+        return self.session_map
+        
+
+    def get(self):
         return self.session_map
         
 

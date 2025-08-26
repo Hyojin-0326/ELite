@@ -38,3 +38,6 @@ logs/
 
 # Ignore data
 data/
+
+#Ignore DynamicMap
+DynamicMap_Benchmark/
