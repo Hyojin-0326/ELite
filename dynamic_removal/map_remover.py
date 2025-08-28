@@ -9,6 +9,7 @@ import faiss
 from utils.session import Session
 from utils.session_map import SessionMap
 from utils.logger import logger
+import time
 
 
 def downsample_points_torch(points, voxel_size: float):
@@ -169,10 +170,16 @@ class MapRemover:
         eph_l = torch.zeros(session_map_tensor.shape[0], device=session_map_tensor.device)
         logger.info("Initialized session map")
 
+        print("Start run()")
+        t0 = time.time()
+
         # Create anchor points
+        t_ds = time.time()
         anchor_points_tensor = downsample_points_torch(
             session_map_tensor, p_dor["anchor_voxel_size"]
         )
+        print(f"Voxel downsampling took {time.time() - t_ds:.2f} sec")
+
         num_anchor_points = anchor_points_tensor.shape[0]
         if num_anchor_points == 0:
             raise RuntimeError("Empty anchor points, check voxel size or input data.")
@@ -182,30 +189,50 @@ class MapRemover:
         if k < k_req:
             logger.warning(f"num_k({k_req}) > #anchors({num_anchor_points}) → using k={k}")
 
+        t_build = time.time()
         self.build_faiss_index(anchor_points_tensor)
+        print(f"Build FAISS index took {time.time() - t_build:.2f} sec")
 
-        # Bayesian update (logit domain)
-        anchor_logits = torch.zeros(num_anchor_points, device=session_map_tensor.device)
-        anchor_counts = torch.zeros(num_anchor_points, device=session_map_tensor.device)
-
+        anchor_eph_l = torch.full((num_anchor_points,), 0.5, device=session_map_tensor.device)
         def logit(p): return torch.log(p / (1 - p + 1e-9))
         def inv_logit(l): return torch.sigmoid(l)
 
         # Update loop
+        t_update_loop = time.time()
         for i in trange(0, self.num_scans, p_dor["stride"], desc="Updating ε_l", ncols=100):
-            logger.info(f"Processing scan {i+1}/{self.num_scans}")
+            print(f"Scan {i+1}/{self.num_scans}")
+
             scan = self.gpu_scans[i]
             pose = self.gpu_poses[i]
             
             # Occupied update
+            t_knn_occ = time.time()
             dists, inds = self.faiss_knn(scan, p_dor["num_k"])
+            print(f"  Occupied FAISS took {time.time() - t_knn_occ:.2f} sec")
+
+
+            t_occupied_update_rate = time.time()
             update_rate = torch.minimum(
                 self.alpha * (1 - torch.exp(-1 * dists**2 / self.std_dev_o)) + self.beta,
                 torch.tensor(self.alpha, device=dists.device)
             )
-            logit_update = logit(update_rate)
-            anchor_logits.scatter_add_(0, inds.flatten(), logit_update.flatten())  
-            anchor_counts.scatter_add_(0, inds.flatten(), torch.ones_like(logit_update).flatten())
+            print(f"update rate took {time.time()-t_occupied_update_rate:.2f} sec")
+
+            flat_idx = inds.reshape(-1)
+            flat_r = update_rate.reshape(-1)
+
+            t_occupied_loop = time.time()
+            for j in range(flat_idx.numel()):
+                idx = flat_idx[j]
+                p   = anchor_eph_l[idx]
+                r   = flat_r[j]
+                p_new = (p * r) / (p * r + (1 - p) * (1 - r))
+                anchor_eph_l[idx] = p_new
+                print(f"{j} of rage{flat_idx.numel()}만큼돎 ")
+
+            print(f"occupied loop took {time.time()-t_occupied_loop} sec")
+
+            
 
             # Free space update
             shifted_scan = scan - pose
@@ -215,20 +242,34 @@ class MapRemover:
             )
             free_space_samples = pose + shifted_scan[:, None, :] * sample_ratios[None, :, None]
             free_space_samples = free_space_samples.reshape(-1, 3)
-            free_space_samples = downsample_points_torch(free_space_samples, 0.1)
 
+            t_ds2 = time.time()
+            free_space_samples = downsample_points_torch(free_space_samples, 0.1)
+            print(f"  Free-space downsample took {time.time() - t_ds2:.2f} sec")
+
+            t_knn_free = time.time()
             dists, inds = self.faiss_knn(free_space_samples, p_dor["num_k"])
+            print(f"  Free-space FAISS took {time.time() - t_knn_free:.2f} sec")
+
             update_rate = torch.clamp(
                 self.alpha * (1 + torch.exp(-1 * dists.flatten()**2 / self.std_dev_f)) - self.beta,
                 min=self.alpha
             )
-            logit_update = logit(update_rate)
-            anchor_logits.scatter_add_(0, inds.flatten(), logit_update.flatten()) 
-            anchor_counts.scatter_add_(0, inds.flatten(), torch.ones_like(logit_update))
+            flat_idx_f = inds.reshape(-1)
+            flat_r_f = update_rate.reshape(-1)
 
-        anchor_eph_l = inv_logit(anchor_logits) 
+            for j in range(flat_idx_f.numel()):
+                idx = flat_idx_f[j]
+                p = anchor_eph_l[idx]
+                r = flat_r_f[j]
+                p_new = (p * r) / (p * r + (1 - p) * (1 - r))
+                anchor_eph_l[idx] = p_new
+                print(f"{j} of rage{flat_idx_f.numel()}만큼돎 ")
 
-        # Propagate anchor ephemerality to full session map
+        print(f"Update loop took {time.time() - t_update_loop:.2f} sec")
+
+        # Propagate anchor ephemerality
+        t_propagate = time.time()
         distances, indices = self.faiss_knn(session_map_tensor, p_dor["num_k"])
         distances = torch.clamp(distances, min=1e-6)
         weights = (1 / (distances**2))
@@ -237,46 +278,34 @@ class MapRemover:
         eph_vals = anchor_eph_l[indices]
         eph_l = (weights * eph_vals).sum(dim=1)
         eph_l = torch.clamp(eph_l, 0.0, 1.0)
+        print(f"Propagate anchor ephemerality took {time.time() - t_propagate:.2f} sec")
 
-        # Split static/dynamic points
+        # Split + Save
+        t_split = time.time()
         static_mask = eph_l <= p_dor["dynamic_threshold"]
         dynamic_mask = ~static_mask
-
         static_points = session_map_tensor[static_mask]
         dynamic_points = session_map_tensor[dynamic_mask]
         static_eph_l = eph_l[static_mask]
+        print(f"Splitting points took {time.time() - t_split:.2f} sec")
 
+        t_save = time.time()
         static_points_np = static_points.detach().cpu().numpy()
         dynamic_points_np = dynamic_points.detach().cpu().numpy()
         static_eph_l_np = static_eph_l.detach().cpu().numpy()
 
-        logger.info(f"Static points: {static_points_np.shape}, Dynamic points: {dynamic_points_np.shape}")
-
-        # Build cleaned session map
-        cleaned_session_map = SessionMap(static_points_np, static_eph_l_np)
-        self.session_map = cleaned_session_map
-
-        # Save results
         static_pcd, dynamic_pcd = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
         static_pcd.points = o3d.utility.Vector3dVector(static_points_np.astype(np.float64))
         dynamic_pcd.points = o3d.utility.Vector3dVector(dynamic_points_np.astype(np.float64))
         static_pcd.paint_uniform_color([0.5, 0.5, 0.5])
         dynamic_pcd.paint_uniform_color([1.0, 0.0, 0.0])
-
         if p_dor["save_static_dynamic_map"]:
             o3d.io.write_point_cloud(os.path.join(p_settings["output_dir"], "static_points.pcd"), static_pcd)  
             o3d.io.write_point_cloud(os.path.join(p_settings["output_dir"], "dynamic_points.pcd"), dynamic_pcd)
-        return self.session_map
-        
+        print(f"Saving point clouds took {time.time() - t_save:.2f} sec")
 
-    def get(self):
-        """Return cleaned session map."""
-        return self.session_map
-        
+        print(f"Total run() time: {time.time() - t0:.2f} sec")
 
-if __name__ == "__main__":
-    config = "../config/sample.yaml"
-    remover = MapRemover(config)
-    remover.load()
-    remover.run()
-    cleaned_session_map = remover.get()
+        cleaned_session_map = SessionMap(static_points_np, static_eph_l_np)
+        self.session_map = cleaned_session_map
+        return self.session_map
