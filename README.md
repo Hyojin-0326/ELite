@@ -78,13 +78,6 @@ on **SemanticKITTI**[1, 2], reporting map-level static/dynamic separation accura
 The results are obtained from the final cleaned static map produced after
 dynamic object removal.
 
-## Limitations
-
-The performance of the dynamic object removal module depends on several
-hyperparameters (e.g., ephemerality thresholds and neighborhood size).
-While the reported results use the same settings as prior ELite evaluations,
-further tuning may be required for different datasets or sensor configurations.
-
 
 ### Summary
 
