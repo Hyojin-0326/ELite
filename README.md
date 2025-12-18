@@ -1,4 +1,5 @@
 # Elite: GPU-Accelerated Dynamic Object Removal for LiDAR SLAM
+<img width="2192" height="1298" alt="image" src="https://github.com/user-attachments/assets/00095838-95b2-4eb8-86ca-99e479195e27" />
 
 This repository contains an optimized implementation of **Elite**, a LiDAR-based
 dynamic object removal pipeline designed for **SLAM and static map construction**.
@@ -60,7 +61,7 @@ We report standard evaluation metrics:
 ## Benchmark Results
 
 We evaluate the optimized ELite implementation using the **DynamicMap benchmark**
-on **SemanticKITTI**, reporting map-level static/dynamic separation accuracy.
+on **SemanticKITTI**[1, 2], reporting map-level static/dynamic separation accuracy.
 
 ### Sequence 00
 
@@ -86,4 +87,15 @@ Despite a ~17×–20× runtime reduction, the optimized implementation:
 - Produces SLAM-ready static maps without additional artifacts
 
 This confirms that system-level optimization does not compromise mapping quality.
+
+## References
+
+[1] H. Gil, D. Lee, G. Kim, and A. Kim,  
+    *Ephemerality Meets LiDAR-based Lifelong Mapping*,  
+    arXiv:2502.13452, 2025.
+
+[2] Q. Zhang et al.,  
+    *A Dynamic Points Removal Benchmark in Point Cloud Maps*,  
+    IEEE ITSC, 2023.
+
 
